@@ -1,0 +1,8 @@
+streamlit
+supabase
+ultralytics
+opencv-python-headless==4.9.0.80
+pandas
+numpy>=1.26.0,<2.0.0
+plotly
+pyserial
