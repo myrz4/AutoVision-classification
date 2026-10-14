@@ -7,15 +7,18 @@ import cv2
 import time
 import pandas as pd
 import numpy as np
-import hashlib
 from ultralytics import YOLO
-from supabase import create_client
-from datetime import datetime, timezone
 import serial
 import serial.tools.list_ports
 import plotly.express as px
 import plotly.graph_objects as go
-
+from database import (
+    fetch_all_inspections,
+    fetch_recent_inspections,
+    fetch_today_inspections,
+    init_database,
+    insert_inspection,
+)
 
 # =========================================================
 # 1. STREAMLIT PAGE CONFIGURATION
@@ -26,7 +29,6 @@ st.set_page_config(
     layout="wide",
     page_icon="🛡️"
 )
-
 
 # =========================================================
 # 2. CUSTOM STYLES
@@ -40,7 +42,6 @@ def to_myt(ts_str):
     if ts.tzinfo is None:
         ts = ts.tz_localize("UTC")
     return ts.tz_convert("Asia/Kuala_Lumpur")
-
 
 def apply_custom_styles():
     st.markdown(
@@ -179,34 +180,12 @@ def apply_custom_styles():
         unsafe_allow_html=True
     )
 
-
 apply_custom_styles()
-
-
-# =========================================================
-# 3. SUPABASE CONFIGURATION
-# =========================================================
-
-try:
-    SUPABASE_URL = st.secrets["SUPABASE_URL"]
-    SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
-except Exception:
-    SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-    SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
 
 # =========================================================
 # 4. SESSION STATE
 # =========================================================
-
-if "user" not in st.session_state:
-    st.session_state.user = None
-
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-
-if "pending_delete_user_id" not in st.session_state:
-    st.session_state.pending_delete_user_id = None
 
 if "trend_data" not in st.session_state:
     st.session_state.trend_data = []
@@ -222,10 +201,6 @@ if "session_failed" not in st.session_state:
 
 if "show_session_summary" not in st.session_state:
     st.session_state.show_session_summary = False
-
-if "local_logs" not in st.session_state:
-    st.session_state.local_logs = []
-
 
 # =========================================================
 # 5. CACHED RESOURCES
@@ -245,7 +220,6 @@ def get_default_port(ports):
         if "arduino" in desc or "ch340" in desc or "ch341" in desc or "usb serial" in desc:
             return p.device
     return ports[-1] if ports else None
-
 
 @st.cache_resource
 def connect_arduino(selected_port):
@@ -269,16 +243,6 @@ def connect_arduino(selected_port):
 
 
 @st.cache_resource
-def init_supabase():
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return None
-    try:
-        return create_client(SUPABASE_URL, SUPABASE_KEY)
-    except Exception:
-        return None
-
-
-@st.cache_resource
 def load_model():
     if not os.path.exists("bestimage.pt"):
         return None
@@ -287,14 +251,14 @@ def load_model():
     except Exception:
         return None
 
-
-supabase = init_supabase()
 model = load_model()
 
-if supabase is None:
-    st.session_state["db_ready"] = False
-else:
+try:
+    init_database()
     st.session_state["db_ready"] = True
+except Exception as e:
+    st.session_state["db_ready"] = False
+    print(f"Local database initialization failed: {e}")
 
 if model is None:
     st.session_state["model_ready"] = False
@@ -303,88 +267,16 @@ else:
 
 
 # =========================================================
-# 6. AUTHENTICATION FUNCTIONS
-# =========================================================
-
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
-
-
-def login(username, password):
-    if not username or not password:
-        st.error("Please enter both username and password.")
-        return
-
-    if supabase is None:
-        st.session_state.user = {
-            "id": "demo-user",
-            "username": username or "demo",
-            "role": "admin"
-        }
-        st.session_state.logged_in = True
-        st.success("Login Successful! Running in demo mode.")
-        st.rerun()
-        return
-
-    try:
-        password_hash = hash_password(password)
-
-        with st.spinner("Logging in..."):
-            response = (
-                supabase
-                .table("users")
-                .select("*")
-                .eq("username", username)
-                .eq("password", password_hash)
-                .execute()
-            )
-
-        if len(response.data) > 0:
-            st.session_state.user = response.data[0]
-            st.session_state.logged_in = True
-            st.success("Login Successful!")
-            st.rerun()
-        else:
-            st.error("Invalid username or password.")
-
-    except Exception as e:
-        st.error(f"Login Error: {e}")
-
-
-def logout():
-    st.session_state.user = None
-    st.session_state.logged_in = False
-    st.rerun()
-
-
-# =========================================================
 # 7. DATABASE HELPERS
 # =========================================================
 
 def log_inspection(status, confidence):
     try:
-        data = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "status": status,
-            "confidence_score": float(confidence) if confidence is not None else None,
-            "operator_id": st.session_state.user["id"] if st.session_state.user else "demo-user"
-        }
-
-        if supabase is None:
-            st.session_state.local_logs.append(data)
-            return True
-
-        response = (
-            supabase
-            .table("inspections")
-            .insert(data)
-            .execute()
+        insert_inspection(
+            status=status,
+            confidence_score=float(confidence) if confidence is not None else None,
         )
-
-        if response.data is not None and len(response.data) > 0:
-            return True
-
-        return False
+        return True
 
     except Exception as e:
         print(f"❌ Database Save Error: {e}")
@@ -392,20 +284,8 @@ def log_inspection(status, confidence):
 
 
 def fetch_recent_logs(limit=5):
-    if supabase is None:
-        return list(st.session_state.local_logs)[-limit:][::-1]
-
     try:
-        response = (
-            supabase
-            .table("inspections")
-            .select("*")
-            .order("timestamp", desc=True)
-            .limit(limit)
-            .execute()
-        )
-
-        return response.data
+        return fetch_recent_inspections(limit=limit)
 
     except Exception as e:
         st.error(f"Failed to fetch recent logs: {e}")
@@ -413,37 +293,11 @@ def fetch_recent_logs(limit=5):
 
 
 def fetch_all_inspection_logs(page_size=1000):
-    if supabase is None:
-        return list(st.session_state.local_logs)
-
-    all_rows = []
-    start = 0
-
-    while True:
-        end = start + page_size - 1
-
-        response = (
-            supabase
-            .table("inspections")
-            .select("*")
-            .order("timestamp", desc=True)
-            .range(start, end)
-            .execute()
-        )
-
-        rows = response.data or []
-
-        if not rows:
-            break
-
-        all_rows.extend(rows)
-
-        if len(rows) < page_size:
-            break
-
-        start += page_size
-
-    return all_rows
+    try:
+        return fetch_all_inspections()
+    except Exception as e:
+        st.error(f"Failed to fetch inspection logs: {e}")
+        return []
 
 
 def update_log_display(container):
@@ -479,21 +333,8 @@ def update_log_display(container):
 
 
 def display_operator_charts(container):
-    if supabase is None:
-        container.info("Database not configured. Charts will appear when the backend is available.")
-        return
-
     try:
-        today = datetime.now(timezone.utc).date().isoformat()
-        response = (
-            supabase
-            .table("inspections")
-            .select("status")
-            .gte("timestamp", f"{today}T00:00:00+00:00")
-            .execute()
-        )
-
-        df = pd.DataFrame(response.data)
+        df = pd.DataFrame(fetch_today_inspections())
 
         container.empty()
 
@@ -566,21 +407,8 @@ def display_operator_charts(container):
 
 
 def fetch_today_counts():
-    if supabase is None:
-        passed = sum(1 for r in st.session_state.local_logs if r.get("status") == "Pass")
-        failed = sum(1 for r in st.session_state.local_logs if r.get("status") == "Fail")
-        return passed, failed
-
     try:
-        today = datetime.now(timezone.utc).date().isoformat()
-        response = (
-            supabase
-            .table("inspections")
-            .select("status")
-            .gte("timestamp", f"{today}T00:00:00+00:00")
-            .execute()
-        )
-        rows = response.data or []
+        rows = fetch_today_inspections()
         passed = sum(1 for r in rows if r["status"] == "Pass")
         failed = sum(1 for r in rows if r["status"] == "Fail")
         return passed, failed
@@ -698,30 +526,6 @@ def render_trend(container):
 
 
 # =========================================================
-# 8. LOGIN SCREEN
-# =========================================================
-
-if not st.session_state.logged_in:
-    try:
-        st.image(LOGO_PATH, width=300)
-    except Exception:
-        pass
-
-    st.title("🔐 AutoVision System Login")
-
-    col1, col2 = st.columns([1, 2])
-
-    with col1:
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-
-        if st.button("Log In", use_container_width=True, type="primary"):
-            login(username, password)
-
-    st.stop()
-
-
-# =========================================================
 # 9. SIDEBAR AND NAVIGATION
 # =========================================================
 
@@ -731,10 +535,7 @@ try:
 except Exception:
     pass
 
-st.sidebar.title(f"👤 {st.session_state.user['username']}")
-st.sidebar.caption(f"Role: {st.session_state.user.get('role', 'Operator').upper()}")
-
-role = st.session_state.user.get("role", "operator")
+st.sidebar.title("Factory Inspection Station")
 
 
 # =========================================================
@@ -775,54 +576,29 @@ cam_ok = st.session_state.get("camera_active", False)
 arduino_ok = arduino is not None and arduino.is_open
 model_ok = model is not None
 
-_last_db_check = st.session_state.get("_last_db_check_time", 0)
-if time.time() - _last_db_check > 30:
-    try:
-        supabase.table("inspections").select("id").limit(1).execute()
-        st.session_state["_db_ok"] = True
-    except Exception:
-        st.session_state["_db_ok"] = False
-    st.session_state["_last_db_check_time"] = time.time()
-db_ok = st.session_state.get("_db_ok", True)
+db_ok = st.session_state.get("db_ready", False)
 
 st.sidebar.markdown(
     f"{'🟢' if cam_ok else '🔴'} **Camera:** {'Active' if cam_ok else 'Inactive'}\n\n"
     f"{'🟢' if arduino_ok else '🔴'} **Arduino:** {'Connected' if arduino_ok else 'Disconnected'}\n\n"
-    f"{'🟢' if db_ok or supabase is None else '🔴'} **Database:** {'Online' if db_ok else 'Offline'}\n\n"
+    f"{'🟢' if db_ok else '🔴'} **Local database:** {'Ready' if db_ok else 'Unavailable'}\n\n"
     f"{'🟢' if model_ok else '🔴'} **AI Model:** {'Loaded' if model_ok else 'Not loaded'}"
 )
 
 
-if role == "admin":
-    menu_options = [
-        "Defect Detection",
-        "Inspection Logs",
-        "User Management (Admin)",
-        "Manage Profile"
-    ]
-else:
-    menu_options = [
-        "Defect Detection",
-        "Manage Profile"
-    ]
+menu_options = ["Defect Detection", "Inspection Logs"]
 
 selected_page = st.sidebar.radio("Navigation", menu_options)
 
 _page_titles = {
     "Defect Detection": "Defect Detection",
     "Inspection Logs": "Inspection Logs",
-    "User Management (Admin)": "User Management",
-    "Manage Profile": "My Profile",
 }
 _title = _page_titles.get(selected_page, selected_page)
 st.markdown(
     f"<script>document.title = '{_title} | DRB-HICOM'</script>",
     unsafe_allow_html=True
 )
-
-if st.sidebar.button("Log Out"):
-    logout()
-
 
 # =========================================================
 # 10. DEFECT DETECTION PAGE
@@ -1081,7 +857,7 @@ if selected_page == "Defect Detection":
 
 
 # =========================================================
-# 12. INSPECTION LOGS PAGE WITH ANALYTICS — ADMIN ONLY
+# 12. INSPECTION LOGS PAGE WITH ANALYTICS
 # =========================================================
 
 elif selected_page == "Inspection Logs":
@@ -1090,20 +866,9 @@ elif selected_page == "Inspection Logs":
     if btn_col.button("🔄 Refresh", use_container_width=True):
         st.rerun()
 
-    if role != "admin":
-        st.warning("You do not have permission to view this page.")
-        st.stop()
-
     try:
         logs_data = fetch_all_inspection_logs(page_size=1000)
         df_logs = pd.DataFrame(logs_data)
-
-        users_res = (
-            supabase
-            .table("users")
-            .select("id, username")
-            .execute()
-        )
 
         if not df_logs.empty:
             df_logs["timestamp"] = pd.to_datetime(df_logs["timestamp"], utc=True).dt.tz_convert("Asia/Kuala_Lumpur")
@@ -1128,18 +893,8 @@ elif selected_page == "Inspection Logs":
 
             df_logs = df_logs.loc[mask]
 
-            if users_res.data:
-                user_map = {
-                    user["id"]: user["username"]
-                    for user in users_res.data
-                }
-
-                if "operator_id" in df_logs.columns:
-                    df_logs["Operator"] = (
-                        df_logs["operator_id"]
-                        .map(user_map)
-                        .fillna("Unknown")
-                    )
+            if "operator_id" in df_logs.columns:
+                df_logs["Operator"] = df_logs["operator_id"].fillna("Not recorded")
 
             if df_logs.empty:
                 st.warning("No inspection records found for the selected date range.")
@@ -1296,256 +1051,3 @@ elif selected_page == "Inspection Logs":
     except Exception as e:
         st.error(f"Error fetching logs: {e}")
 
-
-# =========================================================
-# 12. USER MANAGEMENT PAGE
-# =========================================================
-
-elif selected_page == "User Management (Admin)":
-    st.title("👥 User Management")
-
-    if role != "admin":
-        st.warning("You do not have permission to view this page.")
-        st.stop()
-
-    with st.expander("➕ Add New User", expanded=False):
-        with st.form("add_user_form"):
-            st.subheader("Add New Operator")
-
-            new_user = st.text_input("Username")
-            new_email = st.text_input(
-                "Email",
-                placeholder="e.g. operator@autovision.com"
-            )
-            new_pass = st.text_input("Password", type="password")
-            new_role = st.selectbox("Role", ["operator", "admin"])
-
-            submitted = st.form_submit_button(
-                "Create User",
-                type="primary"
-            )
-
-            if submitted:
-                if not new_user or not new_pass:
-                    st.warning("⚠️ Username and Password are required.")
-                else:
-                    try:
-                        supabase.table("users").insert(
-                            {
-                                "username": new_user,
-                                "email": new_email,
-                                "password": hash_password(new_pass),
-                                "role": new_role
-                            }
-                        ).execute()
-
-                        st.success(f"✅ User '{new_user}' created successfully!")
-                        time.sleep(1)
-                        st.rerun()
-
-                    except Exception as e:
-                        st.error(f"Error creating user: {e}")
-
-    st.divider()
-    st.subheader("Existing Users")
-
-    try:
-        users_res = (
-            supabase
-            .table("users")
-            .select("*")
-            .order("id", desc=False)
-            .execute()
-        )
-
-        users = users_res.data
-
-        if users:
-            h1, h2, h3, h4, h5 = st.columns([1, 2, 2, 1, 1])
-
-            h1.markdown("**ID**")
-            h2.markdown("**Username**")
-            h3.markdown("**Email**")
-            h4.markdown("**Role**")
-            h5.markdown("**Action**")
-
-            st.divider()
-
-            for user in users:
-                c1, c2, c3, c4, c5 = st.columns([1, 2, 2, 1, 1])
-
-                c1.write(str(user["id"]))
-                c2.write(user["username"])
-                c3.write(user.get("email", "-"))
-                c4.write(user["role"].upper())
-
-                if st.session_state.pending_delete_user_id == user["id"]:
-                    c5.warning("Sure?")
-                    conf_col, cancel_col = st.columns(2)
-                    if conf_col.button("Yes, delete", key=f"confirm_del_{user['id']}", type="primary"):
-                        if user["id"] == st.session_state.user["id"]:
-                            st.error("You cannot delete your own account!")
-                            st.session_state.pending_delete_user_id = None
-                        else:
-                            try:
-                                # Detach inspection records before deleting the
-                                # user so the FK constraint is satisfied.
-                                # Logs are preserved and show as "Unknown".
-                                supabase.table("inspections").update(
-                                    {"operator_id": None}
-                                ).eq("operator_id", user["id"]).execute()
-
-                                supabase.table("users").delete().eq(
-                                    "id",
-                                    user["id"]
-                                ).execute()
-
-                                st.session_state.pending_delete_user_id = None
-                                st.toast(f"🗑️ Deleted user: {user['username']}")
-                                time.sleep(0.5)
-                                st.rerun()
-
-                            except Exception as e:
-                                st.error(f"Failed to delete: {e}")
-
-                    if cancel_col.button("Cancel", key=f"cancel_del_{user['id']}"):
-                        st.session_state.pending_delete_user_id = None
-                        st.rerun()
-
-                else:
-                    if c5.button(
-                        "🗑️",
-                        key=f"del_user_{user['id']}",
-                        help="Delete this user"
-                    ):
-                        if user["id"] == st.session_state.user["id"]:
-                            st.error("You cannot delete your own account!")
-                        else:
-                            st.session_state.pending_delete_user_id = user["id"]
-                            st.rerun()
-
-                st.markdown("<hr>", unsafe_allow_html=True)
-
-        else:
-            st.info("No users found.")
-
-    except Exception as e:
-        st.error(f"Error loading users: {e}")
-
-
-# =========================================================
-# 13. MANAGE PROFILE PAGE
-# =========================================================
-
-elif selected_page == "Manage Profile":
-    user = st.session_state.user
-
-    st.title("My Profile Settings")
-
-    with st.container():
-        st.header("Edit Profile")
-
-        col1, col2 = st.columns([3, 1])
-
-        with col1:
-            st.text_input(
-                "Username:",
-                value=user["username"],
-                disabled=True,
-                key="profile_uname"
-            )
-
-        with col2:
-            st.markdown(
-                "<br style='height: 20px;'> (Read Only)",
-                unsafe_allow_html=True
-            )
-
-        current_email = user.get("email", "")
-
-        if current_email is None:
-            current_email = ""
-
-        new_email = st.text_input(
-            "Email:",
-            value=current_email,
-            key="profile_email"
-        )
-
-        st.markdown("---")
-        st.subheader("Change Password")
-
-        current_pass = st.text_input(
-            "Current Password:",
-            type="password",
-            help="Required to save changes",
-            key="p_current"
-        )
-
-        new_pass = st.text_input(
-            "New Password:",
-            type="password",
-            key="p_new"
-        )
-
-        confirm_pass = st.text_input(
-            "Confirm New Password:",
-            type="password",
-            key="p_confirm"
-        )
-
-        st.write("")
-
-        if st.button("Save Changes", type="primary"):
-            error_msg = None
-
-            if not current_pass:
-                error_msg = "⚠️ Please enter your current password to confirm changes."
-
-            elif hash_password(current_pass) != user["password"]:
-                error_msg = "❌ Incorrect current password."
-
-            elif new_pass or confirm_pass:
-                if new_pass != confirm_pass:
-                    error_msg = "❌ New passwords do not match."
-
-                elif len(new_pass) < 6:
-                    error_msg = "⚠️ New password must be at least 6 characters."
-
-            if error_msg:
-                st.error(error_msg)
-
-            else:
-                try:
-                    update_data = {}
-
-                    if new_email != current_email:
-                        update_data["email"] = new_email
-
-                    if new_pass:
-                        update_data["password"] = hash_password(new_pass)
-
-                    if update_data:
-                        (
-                            supabase
-                            .table("users")
-                            .update(update_data)
-                            .eq("id", user["id"])
-                            .execute()
-                        )
-
-                        if "email" in update_data:
-                            st.session_state.user["email"] = new_email
-
-                        if "password" in update_data:
-                            st.session_state.user["password"] = hash_password(new_pass)
-
-                        st.success("✅ Profile updated successfully!")
-                        time.sleep(1)
-                        st.rerun()
-
-                    else:
-                        st.info("No changes detected.")
-
-                except Exception as e:
-                    st.error(f"Failed to update profile: {e}")

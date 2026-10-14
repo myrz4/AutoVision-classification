@@ -5,3 +5,8 @@ __pycache__/
 *.pyc
 .DS_Store
 *.log
+data/*.db
+data/*.db-shm
+data/*.db-wal
+users_rows.csv
+inspections_rows.csv
